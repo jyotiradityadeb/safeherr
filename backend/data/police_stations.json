@@ -1,0 +1,58 @@
+[
+  {
+    "name": "Cubbon Park Police Station",
+    "phone": "100",
+    "latitude": 12.9763,
+    "longitude": 77.5929,
+    "address": "Cubbon Park, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Indiranagar Police Station",
+    "phone": "100",
+    "latitude": 12.9784,
+    "longitude": 77.6408,
+    "address": "Indiranagar, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Jayanagar Police Station",
+    "phone": "100",
+    "latitude": 12.9299,
+    "longitude": 77.5830,
+    "address": "Jayanagar, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Koramangala Police Station",
+    "phone": "100",
+    "latitude": 12.9352,
+    "longitude": 77.6245,
+    "address": "Koramangala, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Malleswaram Police Station",
+    "phone": "100",
+    "latitude": 13.0031,
+    "longitude": 77.5713,
+    "address": "Malleswaram, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Whitefield Police Station",
+    "phone": "100",
+    "latitude": 12.9698,
+    "longitude": 77.7500,
+    "address": "Whitefield, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Hebbal Traffic Police Station",
+    "phone": "100",
+    "latitude": 13.0358,
+    "longitude": 77.5970,
+    "address": "Hebbal, Bengaluru, Karnataka"
+  },
+  {
+    "name": "Yelahanka Police Station",
+    "phone": "100",
+    "latitude": 13.1006,
+    "longitude": 77.5963,
+    "address": "Yelahanka, Bengaluru, Karnataka"
+  }
+]
