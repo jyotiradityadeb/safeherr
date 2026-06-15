@@ -220,4 +220,5 @@ async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     await db["users"].create_index("email", unique=True)
     await db["contacts"].create_index([("user_id", 1), ("created_at", -1)])
     await db["alerts"].create_index([("user_id", 1), ("created_at", -1)])
+    await db["alerts"].create_index([("user_id", 1), ("request_id", 1)], unique=True, sparse=True)
     await db["locations"].create_index([("user_id", 1), ("recorded_at", -1)])

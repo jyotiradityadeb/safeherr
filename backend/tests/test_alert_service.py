@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.schemas.alert import AlertCreate, GestureFeaturePayload, LocationPayload
+from app.schemas.alert import AlertCreate, EmergencyAlertCreate, GestureFeaturePayload, LocationPayload
 from app.services.alert_service import AlertService
 
 from .conftest import seeded_db
@@ -110,3 +110,56 @@ async def test_need_help_reuses_live_room_and_updates_timeline(monkeypatch):
         for item in second["trusted_circle_room"]["timeline"]
     )
     assert len(db["locations"].documents) >= 2
+
+
+@pytest.mark.asyncio
+async def test_manual_sos_is_idempotent_and_never_claims_police_delivery(monkeypatch):
+    db, user_id = seeded_db()
+    service = AlertService(db)
+
+    async def fake_delivery(alert):
+        return {
+            "contact_delivery_status": "SENT",
+            "contact_delivery_results": [
+                {
+                    "name": "Mother",
+                    "phone_number": "+919876543210",
+                    "relation": "Parent",
+                    "status": "SENT",
+                    "error": "",
+                    "sent_at": "2026-06-15T00:00:00+00:00",
+                }
+            ],
+            "contact_delivery_error": "",
+        }
+
+    async def fake_broadcast(message):
+        return None
+
+    monkeypatch.setattr(service.contact_delivery_service, "deliver_contact_messages", fake_delivery)
+    monkeypatch.setattr("app.services.alert_service.realtime_manager.broadcast", fake_broadcast)
+
+    payload = EmergencyAlertCreate(
+        request_id="sos-test-request-1",
+        user_name="Demo User",
+        user_phone="+919999999999",
+        trusted_contacts=[
+            {
+                "name": "Mother",
+                "phone_number": "9876543210",
+                "relation": "Parent",
+            }
+        ],
+        latitude=12.9716,
+        longitude=77.5946,
+        location_source="live_gps",
+    )
+    first = await service.create_emergency_alert(user_id, payload)
+    second = await service.create_emergency_alert(user_id, payload)
+
+    assert first["id"] == second["id"]
+    assert second["idempotent_replay"] is True
+    assert len(db["alerts"].documents) == 1
+    assert first["status"] == "CONTACTS_NOTIFIED"
+    assert first["police_delivery_status"] == "POLICE_CONTACT_NOT_AUTOMATED"
+    assert "message_to_police" not in first

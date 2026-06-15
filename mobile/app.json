@@ -16,7 +16,8 @@
     "plugins": [
       "expo-secure-store",
       "expo-notifications",
-      "expo-asset"
+      "expo-asset",
+      "expo-font"
     ],
     "android": {
       "package": "com.safeher.app",

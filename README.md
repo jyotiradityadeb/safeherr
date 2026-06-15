@@ -1,14 +1,27 @@
-# Federated Learning Based Gesture Threat Detection for Women Safety
+# SafeHer Manual SOS and Safety Monitoring Prototype
 
-This monorepo contains a mobile-first safety platform that detects distress gestures on-device, triggers emergency alerts with live location, and improves the gesture model through federated learning without sending raw user gesture data to the server.
+This monorepo contains a mobile-first safety platform with a verified manual SOS workflow, trusted-contact notification, location capture, admin monitoring, and privacy-preserving ML prototypes.
+
+The current emergency path is **manual SOS**. Gesture classification, TensorFlow Lite export, and federated learning are experimental/demo features and do not automatically trigger the production-facing SOS screen.
 
 ## Project Structure
 
-- `mobile/` React Native Expo app for Android-first safety workflows
+- `mobile/` React Native Expo app for Android-first manual SOS workflows
 - `backend/` FastAPI backend for auth, contacts, alerts, admin, and FL aggregation
 - `admin/` React dashboard for live monitoring and model metrics
 - `ml/` training, feature extraction, TFLite export hooks, and federated simulation
 - `docs/` architecture notes and API references
+
+## Current SOS Flow
+
+1. The authenticated user presses `Send SOS`.
+2. A 25-second countdown displays `Send Now` and `Cancel`.
+3. `Cancel` closes the countdown without creating an alert.
+4. `Send Now` or timer completion submits one request with a reusable request ID.
+5. The backend stores the SOS before attempting provider delivery.
+6. If Twilio is enabled and confirms the requests, contact delivery is reported as `SENT`.
+7. Otherwise, the phone SMS composer opens with recipients and message filled in; the user must press Send.
+8. Police information is a nearest-station suggestion only. No police API delivery is implemented.
 
 ## Architecture Diagram
 
@@ -16,8 +29,8 @@ This monorepo contains a mobile-first safety platform that detects distress gest
 +-------------------+          HTTPS / WebSocket          +----------------------+
 | React Native App  |  --------------------------------> | FastAPI Backend      |
 | - Auth            |                                     | - JWT Auth           |
-| - Gesture Capture | <--------------------------------  | - Contacts API       |
-| - Local Inference |     global model + alert status    | - Alerts API         |
+| - Manual SOS      | <--------------------------------  | - Contacts API       |
+| - SMS fallback    |     alert + delivery status        | - Alerts API         |
 | - GPS + Alerts    |                                     | - FL Aggregation     |
 +---------+---------+                                     | - Admin Metrics      |
           |                                               +----------+-----------+
@@ -71,8 +84,12 @@ uvicorn app.main:app --reload
 cd mobile
 npm install
 copy .env.example .env
-npx expo start
+npx expo start --host lan
 ```
+
+Open the displayed QR code with Expo Go while the phone and development
+computer are on the same network. Set `EXPO_PUBLIC_API_BASE_URL` to the
+computer's reachable LAN address, not `127.0.0.1`.
 
 ### Admin
 
@@ -99,31 +116,63 @@ python scripts\publish_mobile_model.py
 
 ### Docker Local Stack
 
-```bash
+```powershell
+$env:SECRET_KEY="replace-with-a-random-32-character-secret"
 docker compose up --build
 ```
 
 This starts MongoDB, the FastAPI backend on `http://localhost:8000`, and the admin dashboard on `http://localhost:5173`.
 It also runs a one-shot seed container that creates the demo user, contacts, and admin account.
 
-## Production-Oriented Additions
+## Safety and Reliability Additions
 
-- Twilio SMS and WhatsApp delivery with simulated fallback when credentials are missing
-- WebSocket live alert stream at `/ws/alerts`
+- Optional Twilio SMS delivery with explicit enablement and provider-confirmed states
+- Device SMS-composer fallback with `PENDING_USER_CONFIRMATION`
+- Request-ID idempotency and a unique database index to prevent duplicate SOS delivery
+- Admin-authenticated WebSocket alert stream at `/ws/alerts`
 - Secure mobile token persistence with Expo Secure Store
 - Dockerized backend, MongoDB, and admin dashboard
 - Push token registration and Firebase-ready notification hooks
 - Background location tracking hooks for Android
-- TFLite-ready mobile inference adapter with fallback rules engine
+- Experimental TFLite adapter with a rules fallback; automatic gesture SOS remains disabled
 - Role-based admin access for dashboard and aggregation endpoints
+- Authenticated, size-limited audio evidence access
 
-## Real Mobile Model Flow
+## Required Backend Configuration
+
+Copy `backend/.env.example` to `backend/.env`.
+
+Required for non-demo use:
+
+```env
+APP_ENV=production
+SECRET_KEY=use-a-random-secret-of-at-least-32-characters
+MONGODB_URL=mongodb://...
+PUBLIC_ROOM_BASE_URL=https://your-api.example.com
+```
+
+Optional automatic Twilio SMS:
+
+```env
+SMS_GATEWAY_ENABLED=true
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_PHONE_NUMBER=+1...
+SMS_SEND_TIMEOUT_SECONDS=10
+```
+
+If any required Twilio setting is missing or `SMS_GATEWAY_ENABLED=false`, SafeHer returns `PREPARED` and opens the device SMS composer. It does not claim that the SMS was sent.
+
+## Experimental Mobile Model Flow
 
 1. Generate features with `python scripts\prepare_dataset.py`
 2. Train/export a TensorFlow Lite model with `python scripts\train_tflite_model.py`
 3. Copy the exported model into the app with `python scripts\publish_mobile_model.py`
 4. Set `EXPO_PUBLIC_USE_TFLITE=true` in `mobile/.env`
 5. Build the mobile app with native module support
+
+This experimental TFLite path is not available in Expo Go. Keep
+`EXPO_PUBLIC_USE_TFLITE=false` for the verified Expo Go manual SOS workflow.
 
 ## Testing
 
@@ -166,13 +215,22 @@ npm install
 npm test
 ```
 
-## Continuous Integration
+## Status Semantics
 
-- GitHub Actions workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-- Backend tests run on every push and pull request
-- ML smoke tests run on every push and pull request
-- Admin tests run on every push and pull request
-- Mobile logic tests run on every push and pull request
+- `SOS_CREATED`: alert stored; automatic contact delivery is not confirmed.
+- `CONTACTS_NOTIFIED`: all valid provider requests were confirmed.
+- `CONTACT_NOTIFICATION_PARTIAL`: some provider requests succeeded and some failed.
+- `CONTACT_NOTIFICATION_FAILED`: all provider requests failed.
+- `PENDING_USER_CONFIRMATION`: the device SMS composer was opened but sending is not confirmed.
+- `POLICE_CONTACT_NOT_AUTOMATED`: police information is advisory and no police delivery occurred.
+
+## Security Notes
+
+- Production startup rejects the default secret and non-HTTPS public-room URL.
+- Audio evidence requires authenticated owner or administrator access.
+- WebSocket monitoring requires an administrator access token.
+- Replace all demo accounts and credentials before deployment.
+- The Docker stack requires `SECRET_KEY` to be supplied externally.
 
 ## Prototype Demo
 

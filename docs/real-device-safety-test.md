@@ -2,7 +2,7 @@
 
 ## Goal
 Validate real user flow:
-`gesture -> cancel window -> send now -> SMS app -> map link -> status update`.
+`manual SOS -> cancel window -> send now -> SMS app/provider -> result -> done`.
 
 ## Preconditions
 - Android device with SIM and SMS app.
@@ -12,15 +12,15 @@ Validate real user flow:
 
 ## Test Steps
 1. Open SafeHer and go to Home.
-2. Draw emergency gesture.
-3. Confirm full-screen cancel window appears with countdown and vibration.
+2. Tap `Send SOS`.
+3. Confirm the countdown shows both `Send Now` and `Cancel`.
 4. Tap `Send Now`.
 5. Verify SMS draft opens and includes map link.
 6. Tap map link and verify Google Maps opens at correct coordinates.
-7. Return to SafeHer and open `Post-Alert Actions`.
-8. Tap `Share update` and verify trusted circle room updates.
-9. Open `Status` tab and verify alert + room + smart check-in info.
-10. Minimize app and wait past auto-escalation timeout; reopen and verify escalation state.
+7. Verify the result is scrollable and shows individual contact states.
+8. Verify police is labelled as a suggestion and `POLICE_CONTACT_NOT_AUTOMATED`.
+9. Tap `Done` and verify the result closes.
+10. Repeat with timer completion and verify only one alert exists.
 
 ## Friction Notes (fill after run)
 - Permission prompts sequence:
@@ -30,6 +30,8 @@ Validate real user flow:
 - Overlay readability under stress:
 - Smart check-in clarity:
 - Any missed escalations while minimized:
+- Duplicate alert count:
+- Result usability on small screen:
 
 ## Known Risks To Watch
 - If battery optimization is aggressive, background location callbacks may be delayed.

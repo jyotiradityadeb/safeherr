@@ -28,23 +28,21 @@ describe("Dashboard", () => {
   beforeEach(() => {
     vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
     vi.mocked(api.get).mockImplementation((path: string) => {
-      if (path === "/admin/summary") {
+      if (path === "/alerts") {
         return Promise.resolve({
-          data: {
-            total_alerts: 1,
-            active_alerts: 1,
-            avg_confidence: 0.91,
-            recent_alerts: [
-              {
-                id: "alert-1",
-                gesture_label: "distress_swipe",
-                user_id: "user-1",
-                confidence: 0.91,
-                map_link: "https://maps.google.com/?q=1,2",
-                delivery_results: [{ status: "sent" }],
-              },
-            ],
-          },
+          data: [
+            {
+              id: "alert-1",
+              gesture_label: "distress_swipe",
+              user_id: "user-1",
+              confidence: 0.91,
+              status: "CONTACTS_NOTIFIED",
+              map_link: "https://maps.google.com/?q=1,2",
+              contact_delivery_status: "SENT",
+              contact_delivery_results: [{ phone_number: "+919999999999", status: "SENT" }],
+              police_delivery_status: "POLICE_CONTACT_NOT_AUTOMATED",
+            },
+          ],
         });
       }
 
@@ -71,8 +69,9 @@ describe("Dashboard", () => {
     await waitFor(() => {
       expect(screen.getByText("SafeHer Admin Dashboard")).toBeInTheDocument();
       expect(screen.getAllByText("1")).toHaveLength(2);
-      expect(screen.getByText("distress_swipe")).toBeInTheDocument();
-      expect(screen.getAllByText(/0.91/)).toHaveLength(2);
+      expect(screen.getByText(/distress_swipe/)).toBeInTheDocument();
+      expect(screen.getByText("0.91")).toBeInTheDocument();
+      expect(screen.getByText(/POLICE_CONTACT_NOT_AUTOMATED/)).toBeInTheDocument();
     });
   });
 
@@ -83,23 +82,18 @@ describe("Dashboard", () => {
       expect(MockWebSocket.instances).toHaveLength(1);
     });
 
+    const callsBefore = vi.mocked(api.get).mock.calls.filter(([path]) => path === "/alerts").length;
     MockWebSocket.instances[0].onmessage?.({
       data: JSON.stringify({
         type: "alert.created",
-        payload: {
-          id: "alert-2",
-          gesture_label: "panic_circle",
-          user_id: "user-2",
-          confidence: 0.96,
-          map_link: "https://maps.google.com/?q=3,4",
-          delivery_results: [{ status: "simulated" }],
-        },
+        payload: { id: "alert-1" },
       }),
     });
 
     await waitFor(() => {
-      expect(screen.getByText("panic_circle")).toBeInTheDocument();
-      expect(screen.getByText(/simulated/)).toBeInTheDocument();
+      const callsAfter = vi.mocked(api.get).mock.calls.filter(([path]) => path === "/alerts").length;
+      expect(callsAfter).toBeGreaterThan(callsBefore);
+      expect(screen.getAllByText(/distress_swipe/)).toHaveLength(1);
     });
   });
 });

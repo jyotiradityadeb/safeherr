@@ -5,6 +5,7 @@ from typing import Any
 
 from bson import ObjectId
 from fastapi import UploadFile
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.schemas.alert import AlertCreate, EmergencyAlertCreate
@@ -38,6 +39,12 @@ class AlertService:
     # New manual SOS alert flow
     # ------------------------------
     async def create_emergency_alert(self, user_id: str, payload: EmergencyAlertCreate) -> dict:
+        existing = await self._find_idempotent_alert(user_id, payload.request_id)
+        if existing:
+            serialized = self._serialize(existing, await self._resolve_user(user_id))
+            serialized["idempotent_replay"] = True
+            return serialized
+
         user = await self.users.find_one({"_id": ObjectId(user_id)})
         now = datetime.now(timezone.utc)
 
@@ -52,6 +59,9 @@ class AlertService:
                 }
                 for item in contacts
             ]
+        trusted_contacts = self.contact_delivery_service.normalize_contacts(trusted_contacts)
+        if not trusted_contacts:
+            raise ValueError("At least one valid trusted contact phone number is required.")
 
         map_url = payload.map_url or "Location unavailable"
         if payload.latitude is not None and payload.longitude is not None and not payload.map_url:
@@ -77,14 +87,15 @@ class AlertService:
         location_address = geocode.get("formatted_address", "Location address unavailable")
         location_locality = geocode.get("locality", "")
         location_city = geocode.get("city", "")
-        location_source = geocode.get("source", "fallback")
+        location_source = payload.location_source
+        address_source = geocode.get("source", "fallback")
         police_source = nearest_result.get("source", "static_fallback")
 
         maps_enrichment = {
-            "address_source": location_source,
+            "address_source": address_source,
             "police_source": police_source,
-            "google_maps_used": bool(police_source == "google_maps" or location_source == "google_maps"),
-            "fallback_used": bool(police_source != "google_maps" or location_source != "google_maps"),
+            "google_maps_used": bool(police_source == "google_maps" or address_source == "google_maps"),
+            "fallback_used": bool(police_source != "google_maps" or address_source != "google_maps"),
         }
 
         message_to_contacts = self._build_contacts_message(
@@ -101,18 +112,11 @@ class AlertService:
             nearest_station,
             police_source,
         )
-        contact_delivery = self.contact_delivery_service.prepare_contact_messages(
-            {
-                "trusted_contacts": [self._contact_model_dump(item) for item in trusted_contacts],
-                "message_to_contacts": message_to_contacts,
-            }
-        )
-
         ai_agent_input = {
-            "status": "SENT_TO_POLICE",
+            "status": "SOS_CREATED",
             "user_name": payload.user_name,
             "user_phone": payload.user_phone,
-            "trusted_contacts": [self._contact_model_dump(item) for item in trusted_contacts],
+            "trusted_contacts": trusted_contacts,
             "latitude": payload.latitude,
             "longitude": payload.longitude,
             "map_url": map_url,
@@ -130,9 +134,10 @@ class AlertService:
 
         alert = {
             "user_id": user_id,
+            "request_id": payload.request_id,
             "user_name": payload.user_name,
             "user_phone": payload.user_phone,
-            "trusted_contacts": [self._contact_model_dump(item) for item in trusted_contacts],
+            "trusted_contacts": trusted_contacts,
             "latitude": payload.latitude,
             "longitude": payload.longitude,
             "map_url": map_url,
@@ -150,13 +155,15 @@ class AlertService:
             "police_source": police_source,
             "nearby_police_stations": nearest_result.get("top_3", []),
             "maps_enrichment": maps_enrichment,
-            "status": "SENT_TO_POLICE",
-            "status_history": ["ACTIVE", "SENT_TO_CONTACTS", "SENT_TO_POLICE"],
+            "status": "SOS_CREATED",
+            "status_history": ["SOS_CREATED"],
+            "police_delivery_status": "POLICE_CONTACT_NOT_AUTOMATED",
             "message_to_contacts": message_to_contacts,
-            "message_to_police": message_to_police,
+            "police_message_preview": message_to_police,
             "ai_agent_analysis": ai_agent_analysis,
-            "contact_delivery_status": contact_delivery.get("contact_delivery_status", "NOT_ATTEMPTED"),
-            "contact_delivery_results": contact_delivery.get("contact_delivery_results", []),
+            "contact_delivery_status": "NOT_ATTEMPTED",
+            "contact_delivery_results": [],
+            "contact_delivery_error": "",
             "created_at": now,
             "resolved_at": None,
             "demo_mode": True,
@@ -166,13 +173,37 @@ class AlertService:
                 "user_email": user.get("email") if user else None,
             },
         }
-        result = await self.alerts.insert_one(alert)
+        try:
+            result = await self.alerts.insert_one(alert)
+        except DuplicateKeyError:
+            existing = await self._find_idempotent_alert(user_id, payload.request_id)
+            if existing:
+                serialized = self._serialize(existing, user)
+                serialized["idempotent_replay"] = True
+                return serialized
+            raise
         alert["_id"] = result.inserted_id
 
-        print("SAFEHER DEMO CONTACT MESSAGE")
-        print(message_to_contacts)
-        print("SAFEHER DEMO POLICE MESSAGE")
-        print(message_to_police)
+        contact_delivery = await self.contact_delivery_service.deliver_contact_messages(
+            {
+                "trusted_contacts": trusted_contacts,
+                "message_to_contacts": message_to_contacts,
+            }
+        )
+        contact_delivery_status = contact_delivery.get("contact_delivery_status", "NOT_ATTEMPTED")
+        alert_status = self._alert_status_for_delivery(contact_delivery_status)
+        status_history = ["SOS_CREATED"]
+        if alert_status != "SOS_CREATED":
+            status_history.append(alert_status)
+        delivery_update = {
+            "status": alert_status,
+            "status_history": status_history,
+            "contact_delivery_status": contact_delivery_status,
+            "contact_delivery_results": contact_delivery.get("contact_delivery_results", []),
+            "contact_delivery_error": contact_delivery.get("contact_delivery_error", ""),
+        }
+        await self.alerts.update_one({"_id": alert["_id"]}, {"$set": delivery_update})
+        alert.update(delivery_update)
 
         serialized = self._serialize(alert, user)
         await realtime_manager.broadcast({"type": "alert.created", "payload": serialized})
@@ -262,17 +293,25 @@ class AlertService:
 
         next_results = list(result_by_phone.values())
         next_status = self.contact_delivery_service.aggregate_status(next_results)
+        next_alert_status = self._alert_status_for_delivery(next_status)
+        next_history = list(alert.get("status_history") or [])
+        if next_alert_status not in next_history:
+            next_history.append(next_alert_status)
 
         await self.alerts.update_one(
             {"_id": ObjectId(alert_id)},
             {
                 "$set": {
+                    "status": next_alert_status,
+                    "status_history": next_history,
                     "contact_delivery_status": next_status,
                     "contact_delivery_results": next_results,
                 }
             },
         )
 
+        alert["status"] = next_alert_status
+        alert["status_history"] = next_history
         alert["contact_delivery_status"] = next_status
         alert["contact_delivery_results"] = next_results
         serialized = self._serialize(alert, await self._resolve_user(alert.get("user_id")))
@@ -336,8 +375,9 @@ class AlertService:
             },
             "status": "CANCELLED_FALSE_ALARM",
             "status_history": ["CANCELLED_FALSE_ALARM"],
+            "police_delivery_status": "POLICE_CONTACT_NOT_AUTOMATED",
             "message_to_contacts": f"SafeHer: SOS cancelled by user ({reason}).",
-            "message_to_police": "SafeHer: Demo false-alarm cancel event.",
+            "police_message_preview": "No police contact is required for this cancelled event.",
             "ai_agent_analysis": self.ai_safety_agent.analyze(
                 {
                     "status": "CANCELLED_FALSE_ALARM",
@@ -371,7 +411,15 @@ class AlertService:
             "contact_delivery_results": [],
             "metadata": {"reason": reason},
         }
-        result = await self.alerts.insert_one(alert)
+        try:
+            result = await self.alerts.insert_one(alert)
+        except DuplicateKeyError:
+            existing = await self._find_idempotent_alert(user_id, payload.request_id)
+            if existing:
+                serialized = self._serialize(existing, user)
+                serialized["idempotent_replay"] = True
+                return serialized
+            raise
         alert["_id"] = result.inserted_id
         serialized = self._serialize(alert, user)
         await realtime_manager.broadcast({"type": "alert.created", "payload": serialized})
@@ -381,6 +429,12 @@ class AlertService:
     # Legacy gesture flow (kept for compatibility)
     # ------------------------------
     async def create_alert(self, user_id: str, payload: AlertCreate, public_base_url: str | None = None) -> dict:
+        existing = await self._find_idempotent_alert(user_id, payload.request_id)
+        if existing:
+            serialized = self._serialize(existing, await self._resolve_user(user_id))
+            serialized["idempotent_replay"] = True
+            return serialized
+
         settings = get_settings()
         contacts = await self.contacts.find({"user_id": user_id}).to_list(length=20)
         user = await self.users.find_one({"_id": ObjectId(user_id)})
@@ -388,6 +442,7 @@ class AlertService:
 
         alert = {
             "user_id": user_id,
+            "request_id": payload.request_id,
             "gesture_label": payload.gesture_label,
             "confidence": payload.confidence,
             "location": payload.location.model_dump(),
@@ -474,14 +529,29 @@ class AlertService:
         if not alert:
             raise ValueError("Alert not found.")
 
+        allowed_content_types = {
+            "audio/aac",
+            "audio/mp4",
+            "audio/m4a",
+            "audio/mpeg",
+            "audio/ogg",
+            "audio/wav",
+            "audio/x-m4a",
+        }
+        if audio_file.content_type not in allowed_content_types:
+            raise ValueError("Unsupported audio evidence type.")
+
         suffix = Path(audio_file.filename or "alert-audio.m4a").suffix or ".m4a"
         safe_suffix = suffix if len(suffix) <= 10 else ".m4a"
         filename = f"{alert_id}-{int(datetime.now(timezone.utc).timestamp())}{safe_suffix}"
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         target = self.evidence_dir / filename
-        content = await audio_file.read()
+        max_bytes = get_settings().evidence_max_bytes
+        content = await audio_file.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValueError("Audio evidence exceeds the configured size limit.")
         target.write_bytes(content)
-        evidence_url = f"/evidence/{filename}"
+        evidence_url = f"/api/alerts/{alert_id}/evidence-audio"
 
         await self.alerts.update_one(
             {"_id": ObjectId(alert_id)},
@@ -499,12 +569,37 @@ class AlertService:
         )
         return {"alert_id": alert_id, "audio_evidence_url": evidence_url}
 
+    async def get_audio_evidence(
+        self, user_id: str, alert_id: str, is_admin: bool = False
+    ) -> tuple[Path, str] | None:
+        if not ObjectId.is_valid(alert_id):
+            return None
+        query: dict[str, Any] = {"_id": ObjectId(alert_id)}
+        if not is_admin:
+            query["user_id"] = user_id
+        alert = await self.alerts.find_one(query)
+        evidence = alert.get("audio_evidence") if alert else None
+        filename = str((evidence or {}).get("filename") or "")
+        if not filename or Path(filename).name != filename:
+            return None
+        path = self.evidence_dir / filename
+        if not path.is_file():
+            return None
+        return path, str((evidence or {}).get("content_type") or "audio/mp4")
+
     async def get_admin_summary(self) -> dict:
         alerts = await self.alerts.find({}).sort("created_at", -1).to_list(length=300)
         user_lookup = await self._build_user_lookup(alerts)
         serialized = [self._serialize(alert, user_lookup.get(alert.get("user_id"))) for alert in alerts]
         confidence_values = [item.get("confidence") for item in serialized if item.get("confidence") is not None]
-        active_statuses = {"triggered", "ACTIVE", "SENT_TO_CONTACTS", "SENT_TO_POLICE"}
+        active_statuses = {
+            "triggered",
+            "SOS_CREATED",
+            "CONTACTS_NOTIFIED",
+            "CONTACT_NOTIFICATION_PARTIAL",
+            "CONTACT_NOTIFICATION_FAILED",
+            "PENDING_USER_CONFIRMATION",
+        }
         return {
             "total_alerts": len(serialized),
             "active_alerts": len([alert for alert in serialized if alert.get("status") in active_statuses]),
@@ -527,6 +622,22 @@ class AlertService:
         if not ObjectId.is_valid(str(user_id)):
             return None
         return await self.users.find_one({"_id": ObjectId(str(user_id))})
+
+    async def _find_idempotent_alert(self, user_id: str, request_id: str | None) -> dict | None:
+        if not request_id:
+            return None
+        return await self.alerts.find_one({"user_id": user_id, "request_id": request_id})
+
+    @staticmethod
+    def _alert_status_for_delivery(contact_delivery_status: str) -> str:
+        return {
+            "SENT": "CONTACTS_NOTIFIED",
+            "PARTIALLY_SENT": "CONTACT_NOTIFICATION_PARTIAL",
+            "FAILED": "CONTACT_NOTIFICATION_FAILED",
+            "PENDING_USER_CONFIRMATION": "PENDING_USER_CONFIRMATION",
+            "PREPARED": "SOS_CREATED",
+            "NOT_ATTEMPTED": "SOS_CREATED",
+        }.get(contact_delivery_status, "SOS_CREATED")
 
     @staticmethod
     def _contact_model_dump(contact: Any) -> dict:
@@ -589,6 +700,7 @@ class AlertService:
             "created_at": alert.get("created_at"),
             "resolved_at": alert.get("resolved_at"),
             "metadata": alert.get("metadata"),
+            "request_id": alert.get("request_id"),
             "status_history": alert.get("status_history", []),
         }
         if "gesture_label" in alert:
@@ -629,10 +741,16 @@ class AlertService:
                     "nearby_police_stations": alert.get("nearby_police_stations", []),
                     "maps_enrichment": alert.get("maps_enrichment", {}),
                     "message_to_contacts": alert.get("message_to_contacts"),
-                    "message_to_police": alert.get("message_to_police"),
+                    "police_delivery_status": alert.get(
+                        "police_delivery_status", "POLICE_CONTACT_NOT_AUTOMATED"
+                    ),
+                    "police_message_preview": alert.get(
+                        "police_message_preview", alert.get("message_to_police")
+                    ),
                     "ai_agent_analysis": alert.get("ai_agent_analysis"),
                     "contact_delivery_status": alert.get("contact_delivery_status", "NOT_ATTEMPTED"),
                     "contact_delivery_results": alert.get("contact_delivery_results", []),
+                    "contact_delivery_error": alert.get("contact_delivery_error", ""),
                     "demo_mode": alert.get("demo_mode", True),
                     "source": alert.get("source"),
                 }
