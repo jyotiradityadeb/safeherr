@@ -20,6 +20,7 @@ class GestureFeaturePayload(BaseModel):
 
 
 class AlertCreate(BaseModel):
+    request_id: str | None = Field(default=None, min_length=8, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
     gesture_label: str
     confidence: float = Field(ge=0.0, le=1.0)
     location: LocationPayload
@@ -35,12 +36,16 @@ class TrustedContactPayload(BaseModel):
 
 
 class EmergencyAlertCreate(BaseModel):
+    request_id: str | None = Field(default=None, min_length=8, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
     user_name: str = Field(min_length=1, max_length=100)
     user_phone: str = Field(min_length=5, max_length=20)
     trusted_contacts: List[TrustedContactPayload] = Field(default_factory=list)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     map_url: str | None = Field(default=None, max_length=500)
+    location_source: Literal[
+        "live_gps", "last_known", "cached", "configured_fallback", "unavailable"
+    ] = "unavailable"
 
 
 class ContactDeliveryResultUpdate(BaseModel):

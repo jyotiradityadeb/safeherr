@@ -53,7 +53,8 @@ type AlertRecord = {
     maps_context_used?: boolean;
   };
   message_to_contacts?: string | null;
-  message_to_police?: string | null;
+  police_message_preview?: string | null;
+  police_delivery_status?: string | null;
   contact_delivery_status?:
     | "NOT_ATTEMPTED"
     | "PREPARED"
@@ -81,7 +82,14 @@ type DashboardProps = {
   onLogout?: () => void;
 };
 
-const ACTIVE_STATUSES = new Set(["ACTIVE", "SENT_TO_CONTACTS", "SENT_TO_POLICE", "triggered"]);
+const ACTIVE_STATUSES = new Set([
+  "SOS_CREATED",
+  "CONTACTS_NOTIFIED",
+  "CONTACT_NOTIFICATION_PARTIAL",
+  "CONTACT_NOTIFICATION_FAILED",
+  "PENDING_USER_CONFIRMATION",
+  "triggered",
+]);
 
 function statusClass(status?: string) {
   const value = (status || "").toUpperCase();
@@ -157,7 +165,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   useEffect(() => {
     const wsFallback = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws/alerts`;
-    const wsUrl = import.meta.env.VITE_WS_URL || wsFallback;
+    const wsBaseUrl = import.meta.env.VITE_WS_URL || wsFallback;
+    const token = window.localStorage.getItem("safeher_admin_token") || "";
+    const wsUrl = `${wsBaseUrl}${wsBaseUrl.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
 
@@ -278,6 +288,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <span className={statusClass(alert.status)}>{alert.status || "UNKNOWN"}</span>
               </div>
               <div className="muted">Alert ID: {alert.id}</div>
+              <div className="muted">Alert type: {alert.gesture_label || "manual_sos"}</div>
               <div className="muted">User phone: {alert.user_phone || "-"}</div>
               <div className="muted">Alert time: {alert.created_at ? new Date(alert.created_at).toLocaleString() : "-"}</div>
               <div className="muted">
@@ -288,7 +299,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
               {mapLink ? <a href={mapLink} target="_blank" rel="noreferrer">Open map</a> : <div className="muted">Map: N/A</div>}
               {isFalseAlarm ? <div className="muted">False alarm event: countdown was cancelled before SOS send.</div> : null}
-              <div className="muted">Nearest police: {alert.nearest_police_station_name || "-"}</div>
+              <div className="muted">Suggested nearest police station: {alert.nearest_police_station_name || "-"}</div>
               <div className="muted">Police phone: {alert.nearest_police_station_phone || "-"}</div>
               <div className="muted">Police address: {alert.nearest_police_station_address || "-"}</div>
               <div className="muted">Distance: {alert.police_distance_km ?? "-"} km</div>
@@ -302,7 +313,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 Message to contacts: {alert.message_to_contacts || "-"}
               </div>
               <div className="muted" style={{ whiteSpace: "pre-wrap" }}>
-                Message to police: {alert.message_to_police || "-"}
+                Police delivery: {alert.police_delivery_status || "POLICE_CONTACT_NOT_AUTOMATED"}
+                {"\n"}
+                Police message preview: {alert.police_message_preview || "-"}
               </div>
               <div className="muted" style={{ whiteSpace: "pre-wrap" }}>
                 Trusted contact delivery status: {alert.contact_delivery_status || "NOT_ATTEMPTED"}

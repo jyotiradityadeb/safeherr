@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Linking,
@@ -9,16 +9,18 @@ import {
   Text,
   View,
 } from "react-native";
-import * as Location from "expo-location";
 import * as SMS from "expo-sms";
 import * as Clipboard from "expo-clipboard";
+import { Ionicons } from "@expo/vector-icons";
 
 import { api } from "../api/client";
 import { ScreenHeader } from "../components/ui";
 import { spacing } from "../design/tokens";
-import { useTheme } from "../theme/useTheme";
+import { getBestEffortLocation } from "../services/locationFallback";
 import { AppTheme } from "../theme/colors";
+import { useTheme } from "../theme/useTheme";
 import { getErrorMessage } from "../utils/errorMessage";
+import { createSosRequestGuard } from "../utils/sosRequestGuard";
 
 type TrustedContact = {
   name: string;
@@ -35,6 +37,15 @@ type SafetyProfile = {
   trusted_contacts: TrustedContact[];
 };
 
+type DeliveryResult = {
+  name: string;
+  phone_number: string;
+  relation: string;
+  status: "SENT" | "FAILED" | "PENDING_USER_CONFIRMATION" | "PREPARED" | "NOT_ATTEMPTED";
+  error?: string;
+  sent_at?: string | null;
+};
+
 type SentAlert = {
   id: string;
   user_name: string;
@@ -43,30 +54,14 @@ type SentAlert = {
   latitude: number | null;
   longitude: number | null;
   map_url: string;
-  nearest_police_station_name?: string | null;
-  nearest_police_station_phone?: string | null;
-  nearest_police_station_address?: string | null;
-  police_distance_km?: number | null;
-  police_source?: string | null;
   location_address?: string | null;
   location_source?: string | null;
-  nearby_police_stations?: Array<{
-    name: string;
-    address: string;
-    distance_km?: number;
-    source?: string;
-  }>;
-  ai_agent_analysis?: {
-    risk_level?: string;
-    priority_score?: number;
-    alert_summary?: string;
-    reasoning?: string;
-    recommended_actions?: string[];
-    next_steps_for_user?: string[];
-    maps_context_used?: boolean;
-  };
+  nearest_police_station_name?: string | null;
+  nearest_police_station_address?: string | null;
+  police_distance_km?: number | null;
+  police_delivery_status?: string;
+  police_message_preview?: string | null;
   message_to_contacts?: string | null;
-  message_to_police?: string | null;
   contact_delivery_status?:
     | "NOT_ATTEMPTED"
     | "PREPARED"
@@ -74,55 +69,41 @@ type SentAlert = {
     | "PARTIALLY_SENT"
     | "FAILED"
     | "PENDING_USER_CONFIRMATION";
-  contact_delivery_results?: Array<{
-    name: string;
-    phone_number: string;
-    relation: string;
-    status: "SENT" | "FAILED" | "PENDING_USER_CONFIRMATION" | "PREPARED" | "NOT_ATTEMPTED";
-    error?: string;
-    sent_at?: string | null;
-  }>;
+  contact_delivery_results?: DeliveryResult[];
+  contact_delivery_error?: string;
   status: string;
 };
 
 const COUNTDOWN_SECONDS = 25;
 
+function createRequestId() {
+  return `sos-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 async function captureBestEffortLocation() {
-  try {
-    const permission = await Location.requestForegroundPermissionsAsync();
-    if (!permission.granted) {
-      return {
-        latitude: null,
-        longitude: null,
-        map_url: "Location unavailable",
-      };
-    }
-    const current = await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.Balanced,
-    }).catch(() => null);
-    const lastKnown = current ? null : await Location.getLastKnownPositionAsync();
-    const best = current || lastKnown;
-    if (!best) {
-      return {
-        latitude: null,
-        longitude: null,
-        map_url: "Location unavailable",
-      };
-    }
-    const latitude = Number(best.coords.latitude.toFixed(6));
-    const longitude = Number(best.coords.longitude.toFixed(6));
-    return {
-      latitude,
-      longitude,
-      map_url: `https://www.google.com/maps?q=${latitude},${longitude}`,
-    };
-  } catch {
+  const location = await getBestEffortLocation();
+  if (location.source === "unavailable") {
     return {
       latitude: null,
       longitude: null,
       map_url: "Location unavailable",
+      location_source: "unavailable" as const,
     };
   }
+
+  const latitude = Number(location.latitude.toFixed(6));
+  const longitude = Number(location.longitude.toFixed(6));
+  return {
+    latitude,
+    longitude,
+    map_url: `https://www.google.com/maps?q=${encodeURIComponent(`${latitude},${longitude}`)}`,
+    location_source:
+      location.source === "current"
+        ? ("live_gps" as const)
+        : location.source === "last_known"
+          ? ("last_known" as const)
+          : ("cached" as const),
+  };
 }
 
 export function HomeScreen() {
@@ -137,184 +118,185 @@ export function HomeScreen() {
   const [sentAlert, setSentAlert] = useState<SentAlert | null>(null);
   const [smsBusy, setSmsBusy] = useState(false);
   const [smsStatusNote, setSmsStatusNote] = useState("");
+  const sendingRef = useRef(false);
+  const requestGuardRef = useRef(createSosRequestGuard());
+  const requestIdRef = useRef<string | null>(null);
 
-  const loadProfile = async () => {
+  const loadProfile = async (): Promise<SafetyProfile | null> => {
     setLoadingProfile(true);
     try {
       const { data } = await api.get("/profile/me");
       setProfile(data);
       setMessage("");
+      return data;
     } catch {
       setProfile(null);
       setMessage("Please complete your safety profile before sending SOS.");
+      return null;
     } finally {
       setLoadingProfile(false);
     }
   };
 
-  useEffect(() => {
-    loadProfile().catch(() => undefined);
-  }, []);
+  const isProfileComplete = (candidate: SafetyProfile | null) =>
+    Boolean(
+      candidate?.full_name?.trim() &&
+        candidate?.phone_number?.trim() &&
+        candidate.trusted_contacts?.length
+    );
 
-  useEffect(() => {
-    if (!countdownVisible) {
-      return;
+  const syncContactDelivery = async (
+    alert: SentAlert,
+    status: "SENT" | "FAILED" | "PENDING_USER_CONFIRMATION" | "PREPARED",
+    error = ""
+  ) => {
+    const results = (alert.trusted_contacts || []).map((contact) => ({
+      phone_number: contact.phone_number,
+      status,
+      error,
+    }));
+    if (!results.length) {
+      return alert;
     }
-    if (countdown <= 0) {
-      sendAlert().catch(() => undefined);
-      return;
-    }
-    const timer = setTimeout(() => {
-      setCountdown((value) => value - 1);
-    }, 1000);
-    return () => clearTimeout(timer);
-  }, [countdownVisible, countdown]);
-
-  const isProfileComplete = () => {
-    if (!profile) {
-      return false;
-    }
-    if (!profile.full_name?.trim()) {
-      return false;
-    }
-    if (!profile.phone_number?.trim()) {
-      return false;
-    }
-    return (profile.trusted_contacts || []).length > 0;
+    const { data } = await api.post(`/alerts/${alert.id}/contact-delivery/mark-sent`, {
+      results,
+    });
+    setSentAlert(data);
+    return data as SentAlert;
   };
 
-  const handleSendSosPress = async () => {
-    await loadProfile();
-    if (!isProfileComplete()) {
-      setMessage("Please complete your safety profile before sending SOS.");
+  const openSmsComposer = async (alert: SentAlert) => {
+    if (smsBusy) {
       return;
     }
-    setMessage("");
-    setCountdown(COUNTDOWN_SECONDS);
-    setCountdownVisible(true);
-  };
+    const recipients = Array.from(
+      new Set(
+        (alert.trusted_contacts || [])
+          .map((contact) => String(contact.phone_number || "").trim())
+          .filter(Boolean)
+      )
+    );
+    const body = alert.message_to_contacts || "";
+    if (!recipients.length || !body.trim()) {
+      setSmsStatusNote("No valid trusted-contact SMS message is available.");
+      return;
+    }
 
-  const cancelCountdown = async () => {
-    setCountdownVisible(false);
-    setCountdown(COUNTDOWN_SECONDS);
-    setMessage("False alarm cancelled. SOS alert was not sent.");
+    setSmsBusy(true);
     try {
-      await api.post("/alerts/cancel-false-alarm");
-    } catch {
-      // keep cancel resilient in demo mode
+      if (!(await SMS.isAvailableAsync())) {
+        setSmsStatusNote("The SMS app is unavailable. The message remains prepared but unsent.");
+        await syncContactDelivery(alert, "PREPARED");
+        return;
+      }
+
+      setSmsStatusNote("The SMS app is opening. You must press Send to notify your contacts.");
+      await syncContactDelivery(alert, "PENDING_USER_CONFIRMATION");
+      const result = await SMS.sendSMSAsync(recipients, body);
+      if (result.result === "sent") {
+        await syncContactDelivery(alert, "SENT");
+        setSmsStatusNote("The device SMS app reported that the message was sent.");
+      } else {
+        await syncContactDelivery(alert, "PENDING_USER_CONFIRMATION");
+        setSmsStatusNote("SMS delivery is not confirmed. Reopen the composer and press Send if needed.");
+      }
+    } catch (error: any) {
+      const detail = getErrorMessage(error, "Could not open the SMS composer.");
+      setSmsStatusNote(detail);
+      try {
+        await syncContactDelivery(alert, "FAILED", detail);
+      } catch {
+        // The SOS remains stored even when delivery-status synchronization fails.
+      }
+    } finally {
+      setSmsBusy(false);
     }
   };
 
   const sendAlert = async () => {
-    if (!profile || sending) {
+    if (!profile || sendingRef.current || !requestGuardRef.current.claim()) {
       return;
     }
+
+    sendingRef.current = true;
     setSending(true);
+    setCountdownVisible(false);
     try {
       const location = await captureBestEffortLocation();
-      const payload = {
+      const requestId = requestIdRef.current || createRequestId();
+      requestIdRef.current = requestId;
+      const { data } = await api.post("/alerts", {
+        request_id: requestId,
         user_name: profile.full_name,
         user_phone: profile.phone_number,
         trusted_contacts: profile.trusted_contacts,
         latitude: location.latitude,
         longitude: location.longitude,
         map_url: location.map_url,
-      };
-      const { data } = await api.post("/alerts", payload);
+        location_source: location.location_source,
+      });
       setSentAlert(data);
-      setSmsStatusNote("");
-      setMessage("SOS Alert Sent");
-    } catch (error: any) {
-      setMessage(getErrorMessage(error, "Failed to send SOS alert. Please try again."));
-    } finally {
-      setCountdownVisible(false);
-      setCountdown(COUNTDOWN_SECONDS);
-      setSending(false);
-    }
-  };
+      setMessage("SOS created.");
 
-  const syncContactDelivery = async (
-    status: "SENT" | "FAILED" | "PENDING_USER_CONFIRMATION" | "PREPARED",
-    error = ""
-  ) => {
-    if (!sentAlert) {
-      return;
-    }
-    const contacts = sentAlert.trusted_contacts || [];
-    if (!contacts.length) {
-      return;
-    }
-    const results = contacts.map((contact) => ({
-      phone_number: contact.phone_number,
-      status,
-      error,
-    }));
-    const { data } = await api.post(`/alerts/${sentAlert.id}/contact-delivery/mark-sent`, { results });
-    setSentAlert(data);
-  };
-
-  const handleSendEmergencySms = async () => {
-    if (!sentAlert || smsBusy) {
-      return;
-    }
-    const recipients = (sentAlert.trusted_contacts || [])
-      .map((contact) => contact.phone_number)
-      .filter((value) => String(value || "").trim().length > 0);
-    const body = sentAlert.message_to_contacts || "";
-    if (!recipients.length) {
-      setSmsStatusNote("No trusted contacts available.");
-      return;
-    }
-    if (!body.trim()) {
-      setSmsStatusNote("Emergency message unavailable.");
-      return;
-    }
-
-    setSmsBusy(true);
-    try {
-      const available = await SMS.isAvailableAsync();
-      if (!available) {
-        setSmsStatusNote("SMS app unavailable on this device.");
-        await syncContactDelivery("PREPARED");
-        return;
-      }
-
-      await syncContactDelivery("PENDING_USER_CONFIRMATION");
-      const result = await SMS.sendSMSAsync(recipients, body);
-
-      if (result.result === "sent") {
-        await syncContactDelivery("SENT");
-        setSmsStatusNote("Emergency SMS marked as sent.");
+      if (data.contact_delivery_status === "PREPARED") {
+        await openSmsComposer(data);
+      } else if (data.contact_delivery_status === "SENT") {
+        setSmsStatusNote("The configured SMS provider confirmed all delivery requests.");
       } else {
-        await syncContactDelivery("PENDING_USER_CONFIRMATION");
-        setSmsStatusNote("SMS composer closed. Confirm sent status manually if completed.");
+        setSmsStatusNote(data.contact_delivery_error || "");
       }
     } catch (error: any) {
-      const errorMessage = getErrorMessage(error, "Could not open SMS composer.");
-      setSmsStatusNote(errorMessage);
-      try {
-        await syncContactDelivery("FAILED", errorMessage);
-      } catch {
-        // keep UI resilient if backend update fails
-      }
+      requestGuardRef.current.release();
+      setMessage(
+        getErrorMessage(
+          error,
+          "Failed to create the SOS. Check the connection and retry; the same request ID will be reused."
+        )
+      );
     } finally {
-      setSmsBusy(false);
+      sendingRef.current = false;
+      setSending(false);
+      setCountdown(COUNTDOWN_SECONDS);
     }
   };
 
-  const markSmsSent = async () => {
-    if (!sentAlert || smsBusy) {
+  const startCountdown = async () => {
+    if (sendingRef.current) {
       return;
     }
-    setSmsBusy(true);
-    try {
-      await syncContactDelivery("SENT");
-      setSmsStatusNote("Trusted contact delivery status updated to SENT.");
-    } catch (error: any) {
-      setSmsStatusNote(getErrorMessage(error, "Could not update SMS status."));
-    } finally {
-      setSmsBusy(false);
+    const loadedProfile = await loadProfile();
+    if (!isProfileComplete(loadedProfile)) {
+      setMessage("At least one valid trusted contact is required before sending SOS.");
+      return;
     }
+
+    setProfile(loadedProfile);
+    setSentAlert(null);
+    setSmsStatusNote("");
+    setMessage("");
+    setCountdown(COUNTDOWN_SECONDS);
+    requestGuardRef.current.release();
+    requestIdRef.current = requestIdRef.current || createRequestId();
+    setCountdownVisible(true);
+  };
+
+  const cancelCountdown = () => {
+    if (sendingRef.current) {
+      return;
+    }
+    setCountdownVisible(false);
+    setCountdown(COUNTDOWN_SECONDS);
+    requestIdRef.current = null;
+    requestGuardRef.current.release();
+    setMessage("False alarm cancelled. No SOS alert was created.");
+  };
+
+  const closeResult = () => {
+    setSentAlert(null);
+    setSmsStatusNote("");
+    setMessage("");
+    requestIdRef.current = null;
+    requestGuardRef.current.release();
   };
 
   const copyEmergencyMessage = async () => {
@@ -327,9 +309,27 @@ export function HomeScreen() {
       await Clipboard.setStringAsync(text);
       setSmsStatusNote("Emergency message copied.");
     } catch {
-      setSmsStatusNote("Could not copy emergency message.");
+      setSmsStatusNote("Could not copy the emergency message.");
     }
   };
+
+  useEffect(() => {
+    loadProfile().catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!countdownVisible || sending) {
+      return;
+    }
+    if (countdown <= 0) {
+      sendAlert().catch(() => undefined);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setCountdown((value) => Math.max(value - 1, 0));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [countdownVisible, countdown, sending]);
 
   return (
     <View style={styles.container}>
@@ -337,158 +337,193 @@ export function HomeScreen() {
         <ScreenHeader
           eyebrow="Emergency"
           title="SafeHer Manual SOS"
-          subtitle="Manual SOS only. No sensor-triggered SOS is active."
+          subtitle="Manual SOS is active. Experimental gesture detection does not trigger alerts."
         />
         <View style={styles.card}>
           <Text style={styles.title}>Safety Readiness</Text>
           {loadingProfile ? <ActivityIndicator color={theme.primary} /> : null}
-          <Text style={styles.text}>
-            Profile: {profile?.full_name ? "Configured" : "Missing"}
-          </Text>
-          <Text style={styles.text}>
-            Trusted contacts: {(profile?.trusted_contacts || []).length}
-          </Text>
-          <Pressable style={styles.secondaryButton} onPress={() => loadProfile().catch(() => undefined)}>
+          <Text style={styles.text}>Profile: {profile?.full_name ? "Configured" : "Missing"}</Text>
+          <Text style={styles.text}>Trusted contacts: {(profile?.trusted_contacts || []).length}</Text>
+          <Pressable
+            style={styles.secondaryButton}
+            onPress={() => loadProfile().catch(() => undefined)}
+            accessibilityRole="button"
+            accessibilityLabel="Refresh safety profile"
+          >
             <Text style={styles.secondaryText}>Refresh Profile</Text>
           </Pressable>
         </View>
 
-        <Pressable style={styles.sosButton} onPress={handleSendSosPress} disabled={sending}>
-          <Text style={styles.sosButtonText}>{sending ? "Sending..." : "Send SOS"}</Text>
+        <Pressable
+          style={[styles.sosButton, sending && styles.disabledButton]}
+          onPress={startCountdown}
+          disabled={sending}
+          accessibilityRole="button"
+          accessibilityLabel="Start emergency SOS countdown"
+        >
+          <Text style={styles.sosButtonText}>{sending ? "Sending SOS..." : "Send SOS"}</Text>
         </Pressable>
 
         {message ? <Text style={styles.message}>{message}</Text> : null}
       </ScrollView>
 
-      <Modal visible={countdownVisible} transparent animationType="fade">
+      <Modal
+        visible={countdownVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={cancelCountdown}
+      >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
+          <View style={styles.countdownCard}>
             <Text style={styles.modalTitle}>Emergency Countdown</Text>
-            <Text style={styles.modalText}>
-              SOS alert will be sent in 25 seconds.
-            </Text>
+            <Text style={styles.modalText}>SOS will be created when the timer reaches zero.</Text>
             <Text style={styles.timer}>{countdown}s</Text>
-            <Pressable style={styles.cancelButton} onPress={cancelCountdown}>
-              <Text style={styles.cancelButtonText}>Cancel</Text>
-            </Pressable>
+            {sending ? <ActivityIndicator color={theme.danger} size="large" /> : null}
+            <View style={styles.countdownActions}>
+              <Pressable
+                style={[styles.sendNowButton, sending && styles.disabledButton]}
+                onPress={() => sendAlert().catch(() => undefined)}
+                disabled={sending}
+                accessibilityRole="button"
+                accessibilityLabel="Send SOS now"
+                hitSlop={8}
+              >
+                <Text style={styles.actionButtonText}>{sending ? "Sending SOS..." : "Send Now"}</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.cancelButton, sending && styles.disabledButton]}
+                onPress={cancelCountdown}
+                disabled={sending}
+                accessibilityRole="button"
+                accessibilityLabel="Cancel SOS countdown"
+                hitSlop={8}
+              >
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </Pressable>
+            </View>
           </View>
         </View>
       </Modal>
 
-      <Modal visible={Boolean(sentAlert)} transparent animationType="slide">
+      <Modal
+        visible={Boolean(sentAlert)}
+        transparent
+        animationType="slide"
+        onRequestClose={closeResult}
+      >
         <View style={styles.modalOverlay}>
-          <View style={styles.sentCard}>
-            <Text style={styles.modalTitle}>SOS Alert Sent</Text>
-            <Text style={styles.modalText}>User: {sentAlert?.user_name}</Text>
-            <Text style={styles.modalText}>Phone: {sentAlert?.user_phone}</Text>
-            <Text style={styles.modalText}>Status: {sentAlert?.status}</Text>
-            <Text style={styles.modalText}>
-              Address: {sentAlert?.location_address || "Address unavailable. Map link still available."}
-            </Text>
-            <Text style={styles.modalText}>
-              Location source: {sentAlert?.location_source || "fallback"}
-            </Text>
-            <Text style={styles.modalText}>
-              Nearest police: {sentAlert?.nearest_police_station_name || "Not available"}
-            </Text>
-            <Text style={styles.modalText}>
-              Police source: {sentAlert?.police_source || "static_fallback"}
-            </Text>
-            <Text style={styles.modalText}>
-              Distance: {sentAlert?.police_distance_km ?? "N/A"} km
-            </Text>
-            <Text style={styles.modalText}>
-              Trusted contacts: {(sentAlert?.trusted_contacts || []).length}
-            </Text>
-            <Pressable
-              style={styles.secondaryButton}
-              disabled={!sentAlert?.map_url || sentAlert?.map_url === "Location unavailable"}
-              onPress={() => {
-                if (sentAlert?.map_url && sentAlert.map_url !== "Location unavailable") {
-                  Linking.openURL(sentAlert.map_url).catch(() => undefined);
-                }
-              }}
+          <View style={styles.resultCard}>
+            <View style={styles.resultHeader}>
+              <Text style={styles.modalTitle}>SOS Result</Text>
+              <Pressable
+                style={styles.closeButton}
+                onPress={closeResult}
+                accessibilityRole="button"
+                accessibilityLabel="Close SOS result"
+                hitSlop={10}
+              >
+                <Ionicons name="close" size={26} color={theme.text} />
+              </Pressable>
+            </View>
+
+            <ScrollView
+              style={styles.resultScroll}
+              contentContainerStyle={styles.resultContent}
+              showsVerticalScrollIndicator
             >
-              <Text style={styles.secondaryText}>Open Map Link</Text>
-            </Pressable>
-            <Text style={styles.previewTitle}>Message Preview (Contacts)</Text>
-            <Text style={styles.previewBody}>{sentAlert?.message_to_contacts || "-"}</Text>
-            <Text style={styles.previewTitle}>Message Preview (Police)</Text>
-            <Text style={styles.previewBody}>{sentAlert?.message_to_police || "-"}</Text>
-            <Text style={styles.previewTitle}>Emergency SMS to Trusted Contacts</Text>
-            <Text style={styles.modalText}>
-              Status: {sentAlert?.contact_delivery_status || "NOT_ATTEMPTED"}
-            </Text>
-            <Text style={styles.previewBody}>
-              {(sentAlert?.contact_delivery_results?.length
-                ? sentAlert.contact_delivery_results
-                    .map(
-                      (item) =>
-                        `${item.name || "Contact"} (${item.phone_number}) - ${item.status}${item.sent_at ? ` at ${new Date(item.sent_at).toLocaleString()}` : ""}${item.error ? ` | ${item.error}` : ""}`
-                    )
-                    .join("\n")
-                : (sentAlert?.trusted_contacts || [])
-                    .map((item) => `${item.name} (${item.phone_number}) - ${item.relation}`)
-                    .join("\n")) || "No trusted contacts."}
-            </Text>
-            <Pressable style={styles.secondaryButton} onPress={handleSendEmergencySms} disabled={smsBusy}>
-              <Text style={styles.secondaryText}>
-                {smsBusy ? "Working..." : "Send Emergency SMS to Trusted Contacts"}
+              <Text style={styles.modalText}>User: {sentAlert?.user_name}</Text>
+              <Text style={styles.modalText}>Phone: {sentAlert?.user_phone}</Text>
+              <Text style={styles.modalText}>Alert status: {sentAlert?.status}</Text>
+              <Text style={styles.modalText}>
+                Coordinates: {sentAlert?.latitude ?? "Unavailable"}, {sentAlert?.longitude ?? "Unavailable"}
               </Text>
-            </Pressable>
-            <Pressable style={styles.secondaryButton} onPress={markSmsSent} disabled={smsBusy}>
-              <Text style={styles.secondaryText}>Mark SMS Sent</Text>
-            </Pressable>
-            <Pressable style={styles.secondaryButton} onPress={copyEmergencyMessage}>
-              <Text style={styles.secondaryText}>Copy Emergency Message</Text>
-            </Pressable>
-            {smsStatusNote ? <Text style={styles.modalText}>{smsStatusNote}</Text> : null}
-            <Text style={styles.previewTitle}>AI Safety Agent</Text>
-            {sentAlert?.ai_agent_analysis ? (
-              <>
-                <Text style={styles.modalText}>
-                  Risk level: {sentAlert.ai_agent_analysis.risk_level || "-"}
-                </Text>
-                <Text style={styles.modalText}>
-                  Priority score: {sentAlert.ai_agent_analysis.priority_score ?? "-"}
-                </Text>
-                <Text style={styles.previewBody}>
-                  {sentAlert.ai_agent_analysis.alert_summary || "Summary unavailable."}
-                </Text>
-                <Text style={styles.previewBody}>
-                  {sentAlert.ai_agent_analysis.reasoning || "Reasoning unavailable."}
-                </Text>
-                <Text style={styles.modalText}>
-                  Maps context used: {sentAlert.ai_agent_analysis.maps_context_used ? "Yes" : "No"}
-                </Text>
-                <Text style={styles.previewTitle}>Recommended Actions</Text>
-                <Text style={styles.previewBody}>
-                  {(sentAlert.ai_agent_analysis.recommended_actions || []).join("\n") || "-"}
-                </Text>
-                <Text style={styles.previewTitle}>Next Steps For User</Text>
-                <Text style={styles.previewBody}>
-                  {(sentAlert.ai_agent_analysis.next_steps_for_user || []).join("\n") || "-"}
-                </Text>
-              </>
-            ) : (
-              <Text style={styles.modalText}>AI Safety Agent analysis unavailable.</Text>
-            )}
-            {sentAlert?.nearby_police_stations?.length ? (
-              <>
-                <Text style={styles.previewTitle}>Top Nearby Police Stations</Text>
-                <Text style={styles.previewBody}>
-                  {sentAlert.nearby_police_stations
-                    .map(
-                      (item, index) =>
-                        `${index + 1}. ${item.name} (${item.distance_km ?? "N/A"} km) - ${item.address}`
-                    )
-                    .join("\n")}
-                </Text>
-              </>
-            ) : null}
-            <Text style={styles.notice}>Demo mode: Alert messages were generated and stored.</Text>
-            <Pressable style={styles.homeButton} onPress={() => setSentAlert(null)}>
-              <Text style={styles.homeButtonText}>Return Home</Text>
+              <Text style={styles.modalText}>
+                Address: {sentAlert?.location_address || "Address unavailable; SOS creation was not blocked."}
+              </Text>
+              <Text style={styles.modalText}>Location source: {sentAlert?.location_source || "unavailable"}</Text>
+              <Text style={styles.modalText}>
+                Trusted contacts: {(sentAlert?.trusted_contacts || []).length}
+              </Text>
+              <Text style={styles.modalText}>
+                Contact notification: {sentAlert?.contact_delivery_status || "NOT_ATTEMPTED"}
+              </Text>
+              {sentAlert?.contact_delivery_error ? (
+                <Text style={styles.warning}>{sentAlert.contact_delivery_error}</Text>
+              ) : null}
+
+              <Text style={styles.previewTitle}>Individual SMS Status</Text>
+              <Text style={styles.previewBody}>
+                {(sentAlert?.contact_delivery_results || [])
+                  .map(
+                    (item) =>
+                      `${item.name || "Contact"}: ${item.status}${item.error ? ` - ${item.error}` : ""}`
+                  )
+                  .join("\n") || "No delivery records are available."}
+              </Text>
+
+              <Text style={styles.previewTitle}>Suggested Nearest Police Station</Text>
+              <Text style={styles.modalText}>
+                {sentAlert?.nearest_police_station_name || "No station suggestion available"}
+              </Text>
+              {sentAlert?.nearest_police_station_address ? (
+                <Text style={styles.modalText}>{sentAlert.nearest_police_station_address}</Text>
+              ) : null}
+              <Text style={styles.modalText}>
+                Police delivery: {sentAlert?.police_delivery_status || "POLICE_CONTACT_NOT_AUTOMATED"}
+              </Text>
+
+              <Text style={styles.previewTitle}>Police Message Preview</Text>
+              <Text style={styles.previewBody}>
+                {sentAlert?.police_message_preview || "No police message preview available."}
+              </Text>
+
+              <Pressable
+                style={styles.secondaryButton}
+                disabled={!sentAlert?.map_url || sentAlert.map_url === "Location unavailable"}
+                onPress={() => {
+                  if (sentAlert?.map_url && sentAlert.map_url !== "Location unavailable") {
+                    Linking.openURL(sentAlert.map_url).catch(() =>
+                      setSmsStatusNote("Could not open the map link.")
+                    );
+                  }
+                }}
+                accessibilityRole="link"
+                accessibilityLabel="Open SOS location in maps"
+              >
+                <Text style={styles.secondaryText}>Open Map Link</Text>
+              </Pressable>
+
+              {sentAlert?.contact_delivery_status !== "SENT" ? (
+                <Pressable
+                  style={[styles.secondaryButton, smsBusy && styles.disabledButton]}
+                  onPress={() => sentAlert && openSmsComposer(sentAlert)}
+                  disabled={smsBusy}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open SMS composer for trusted contacts"
+                >
+                  <Text style={styles.secondaryText}>
+                    {smsBusy ? "Opening SMS..." : "Open SMS Composer"}
+                  </Text>
+                </Pressable>
+              ) : null}
+              <Pressable
+                style={styles.secondaryButton}
+                onPress={copyEmergencyMessage}
+                accessibilityRole="button"
+                accessibilityLabel="Copy emergency message"
+              >
+                <Text style={styles.secondaryText}>Copy Emergency Message</Text>
+              </Pressable>
+              {smsStatusNote ? <Text style={styles.warning}>{smsStatusNote}</Text> : null}
+            </ScrollView>
+
+            <Pressable
+              style={styles.doneButton}
+              onPress={closeResult}
+              accessibilityRole="button"
+              accessibilityLabel="Done and return home"
+            >
+              <Text style={styles.doneButtonText}>Done</Text>
             </Pressable>
           </View>
         </View>
@@ -534,12 +569,13 @@ const createStyles = (theme: AppTheme) =>
     },
     sosButtonText: {
       color: theme.buttonText,
-      fontSize: 30,
+      fontSize: 28,
       fontWeight: "900",
-      letterSpacing: 0.4,
     },
     secondaryButton: {
-      alignSelf: "flex-start",
+      minHeight: 48,
+      alignItems: "center",
+      justifyContent: "center",
       backgroundColor: theme.cardAlt,
       borderRadius: 12,
       borderWidth: 1,
@@ -549,7 +585,8 @@ const createStyles = (theme: AppTheme) =>
     },
     secondaryText: {
       color: theme.text,
-      fontWeight: "700",
+      fontWeight: "800",
+      textAlign: "center",
     },
     message: {
       color: theme.text,
@@ -560,13 +597,14 @@ const createStyles = (theme: AppTheme) =>
     },
     modalOverlay: {
       flex: 1,
-      backgroundColor: "rgba(0,0,0,0.5)",
+      backgroundColor: "rgba(0,0,0,0.58)",
       justifyContent: "center",
       alignItems: "center",
-      padding: spacing.xl,
+      padding: spacing.md,
     },
-    modalCard: {
+    countdownCard: {
       width: "100%",
+      maxWidth: 460,
       borderRadius: 18,
       backgroundColor: theme.surface,
       padding: spacing.xl,
@@ -575,21 +613,10 @@ const createStyles = (theme: AppTheme) =>
       borderColor: theme.border,
       alignItems: "center",
     },
-    sentCard: {
-      width: "100%",
-      maxHeight: "88%",
-      borderRadius: 18,
-      backgroundColor: theme.surface,
-      padding: spacing.xl,
-      gap: spacing.sm,
-      borderWidth: 1,
-      borderColor: theme.border,
-    },
     modalTitle: {
       color: theme.text,
       fontSize: 22,
       fontWeight: "900",
-      textAlign: "center",
     },
     modalText: {
       color: theme.subtext,
@@ -600,20 +627,71 @@ const createStyles = (theme: AppTheme) =>
       fontSize: 54,
       fontWeight: "900",
     },
+    countdownActions: {
+      width: "100%",
+      gap: spacing.md,
+    },
+    sendNowButton: {
+      minHeight: 56,
+      borderRadius: 14,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: theme.danger,
+    },
     cancelButton: {
-      minWidth: 180,
-      borderRadius: 12,
+      minHeight: 56,
+      borderRadius: 14,
       alignItems: "center",
       justifyContent: "center",
       backgroundColor: theme.cardAlt,
       borderWidth: 1,
       borderColor: theme.border,
-      paddingVertical: spacing.sm,
+    },
+    actionButtonText: {
+      color: theme.buttonText,
+      fontWeight: "900",
+      fontSize: 17,
     },
     cancelButtonText: {
       color: theme.text,
       fontWeight: "900",
-      fontSize: 16,
+      fontSize: 17,
+    },
+    disabledButton: {
+      opacity: 0.55,
+    },
+    resultCard: {
+      width: "100%",
+      maxWidth: 540,
+      height: "88%",
+      borderRadius: 18,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      overflow: "hidden",
+    },
+    resultHeader: {
+      minHeight: 58,
+      paddingHorizontal: spacing.lg,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      borderBottomWidth: 1,
+      borderBottomColor: theme.border,
+    },
+    closeButton: {
+      width: 48,
+      height: 48,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    resultScroll: {
+      flex: 1,
+    },
+    resultContent: {
+      padding: spacing.lg,
+      gap: spacing.sm,
+      paddingBottom: spacing.xl,
     },
     previewTitle: {
       color: theme.text,
@@ -627,22 +705,24 @@ const createStyles = (theme: AppTheme) =>
       padding: spacing.sm,
       lineHeight: 19,
     },
-    notice: {
+    warning: {
       color: theme.text,
-      fontWeight: "700",
-      marginTop: spacing.sm,
+      backgroundColor: theme.dangerSoft,
+      borderRadius: 10,
+      padding: spacing.sm,
+      lineHeight: 19,
     },
-    homeButton: {
-      marginTop: spacing.md,
+    doneButton: {
+      minHeight: 56,
+      margin: spacing.md,
+      borderRadius: 14,
       alignItems: "center",
       justifyContent: "center",
       backgroundColor: theme.primary,
-      borderRadius: 12,
-      minHeight: 44,
     },
-    homeButtonText: {
+    doneButtonText: {
       color: theme.buttonText,
       fontWeight: "900",
-      fontSize: 15,
+      fontSize: 17,
     },
   });

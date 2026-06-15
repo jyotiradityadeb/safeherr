@@ -94,7 +94,7 @@ class AISafetyAgent:
                 "Contact the user immediately.",
                 "Open the map link and verify the location.",
                 "Contact trusted contacts.",
-                "Contact nearest police station in demo mode.",
+                "Consider contacting the suggested nearest police station if escalation is required.",
                 "Keep alert active until safety is verified.",
                 "Mark as resolved only after confirmation.",
             ]
@@ -108,7 +108,7 @@ class AISafetyAgent:
                 "Call the user.",
                 "Verify Google Maps link.",
                 "Contact trusted contacts.",
-                "Check nearest police station details.",
+                "Review the suggested nearest police station details.",
                 "Keep alert active until confirmed safe.",
             ]
 

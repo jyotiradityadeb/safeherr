@@ -65,8 +65,8 @@ async def seed() -> None:
                 "updated_at": datetime.now(timezone.utc),
             }
         )
-    print(f"Seeded demo user: {settings.demo_user_email} / {settings.demo_user_password}")
-    print(f"Seeded admin user: {settings.admin_user_email} / {settings.admin_user_password}")
+    print(f"Seeded demo user: {settings.demo_user_email}")
+    print(f"Seeded admin user: {settings.admin_user_email}")
     await close_mongo_connection()
 
 

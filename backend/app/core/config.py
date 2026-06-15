@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     use_google_maps: bool = Field(default=False, alias="USE_GOOGLE_MAPS")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     sms_gateway_enabled: bool = Field(default=False, alias="SMS_GATEWAY_ENABLED")
+    sms_send_timeout_seconds: int = Field(default=10, alias="SMS_SEND_TIMEOUT_SECONDS")
+    evidence_max_bytes: int = Field(default=10_000_000, alias="EVIDENCE_MAX_BYTES")
     public_room_base_url: str = Field(default="http://127.0.0.1:8000", alias="PUBLIC_ROOM_BASE_URL")
     client_origins: str = Field(default="http://localhost:8081,http://localhost:5173", alias="CLIENT_ORIGINS")
     auth_login_max_attempts: int = Field(default=10, alias="AUTH_LOGIN_MAX_ATTEMPTS")

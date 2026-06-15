@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
-from pathlib import Path
 from time import perf_counter
 
+from bson import ObjectId
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from jose import JWTError, jwt
 
 from app.api.routes import router
 from app.core.config import get_settings
@@ -14,10 +14,16 @@ from app.db.database import close_mongo_connection, connect_to_mongo
 from app.services.safety_service import SafetyService
 from app.utils.logging import configure_logging, log_event
 from app.utils.realtime import realtime_manager
+from app.utils.security import ALGORITHM
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if settings.app_env.lower() in {"production", "prod"}:
+        if settings.secret_key == "change-me" or len(settings.secret_key) < 32:
+            raise RuntimeError("Production requires a strong SECRET_KEY of at least 32 characters.")
+        if not settings.public_room_base_url.startswith("https://"):
+            raise RuntimeError("Production requires an HTTPS PUBLIC_ROOM_BASE_URL.")
     await connect_to_mongo()
     yield
     await close_mongo_connection()
@@ -34,9 +40,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router, prefix="/api")
-evidence_dir = Path(__file__).resolve().parents[1] / "data" / "evidence"
-evidence_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/evidence", StaticFiles(directory=evidence_dir), name="evidence")
 
 
 @app.middleware("http")
@@ -287,6 +290,20 @@ async def public_live_room_page(access_token: str, db=Depends(get_database)):
 
 @app.websocket("/ws/alerts")
 async def alerts_websocket(websocket: WebSocket):
+    token = websocket.query_params.get("token", "")
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if payload.get("token_type", "access") != "access" or not ObjectId.is_valid(user_id):
+            raise ValueError("Invalid token.")
+        db = get_database()
+        user = await db["users"].find_one({"_id": ObjectId(user_id)})
+        if not user or not user.get("is_admin", False):
+            raise ValueError("Admin access required.")
+    except (JWTError, ValueError):
+        await websocket.close(code=1008)
+        return
+
     await realtime_manager.connect(websocket)
     try:
         while True:

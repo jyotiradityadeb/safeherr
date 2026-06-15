@@ -27,6 +27,14 @@ def test_health_route_returns_ok():
     assert response.json() == {"status": "ok"}
 
 
+def test_alert_route_rejects_unauthenticated_requests():
+    client = create_test_client(FakeDatabase())
+
+    response = client.post("/api/alerts", json={})
+
+    assert response.status_code == 403
+
+
 def test_signup_route_creates_user(monkeypatch):
     db = FakeDatabase()
     client = create_test_client(db)

@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 from bson import ObjectId
 from jose import JWTError, jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
 from app.api.deps import get_current_admin, get_current_user
@@ -51,8 +52,6 @@ async def api_index():
         "message": "SafeHer backend API is running.",
         "health": "/api/health",
         "docs": "/docs",
-        "admin": "http://192.168.0.101:5173",
-        "expo": "exp://192.168.0.101:8081",
     }
 
 
@@ -64,6 +63,8 @@ async def health_check():
 @router.get("/system/status")
 async def system_status(user=Depends(get_current_user)):
     sms_backend_configured = bool(
+        settings.sms_gateway_enabled
+        and
         settings.twilio_account_sid
         and settings.twilio_auth_token
         and settings.twilio_phone_number
@@ -248,6 +249,8 @@ async def create_alert(
         return await AlertService(db).create_emergency_alert(user["id"], emergency_payload)
     except ValidationError as error:
         raise HTTPException(status_code=422, detail=error.errors()) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.get("/alerts")
@@ -360,7 +363,23 @@ async def upload_alert_audio(
     try:
         return await AlertService(db).attach_audio_evidence(user["id"], alert_id, audio_file)
     except ValueError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
+        status_code = 404 if str(error) == "Alert not found." else 400
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+
+@router.get("/alerts/{alert_id}/evidence-audio")
+async def download_alert_audio(
+    alert_id: str,
+    user=Depends(get_current_user),
+    db=Depends(get_database),
+):
+    evidence = await AlertService(db).get_audio_evidence(
+        user["id"], alert_id, is_admin=user.get("is_admin", False)
+    )
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="Audio evidence not found.")
+    path, media_type = evidence
+    return FileResponse(path, media_type=media_type, filename=path.name)
 
 
 @router.post("/locations")
@@ -540,6 +559,7 @@ async def trigger_demo_alert(
             latitude=payload.latitude,
             longitude=payload.longitude,
             map_url=f"https://www.google.com/maps?q={payload.latitude},{payload.longitude}",
+            location_source="configured_fallback",
         ),
     )
     return {"message": "Demo alert created.", "alert": alert}
